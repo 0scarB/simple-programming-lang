@@ -1,0 +1,54 @@
+This file is a convient way for me to test simple language features and to
+document these features. Lines starting with '|' are program source code and
+following lines with '>' are the expected output.
+
+
+It's a stack based language. Operands and operators are pushed on the stack:
+
+| 1
+Remaining operands on the stack are outputted:
+> 1
+
+| 123
+> 123
+
+| -1
+> -1
+
+| 1 2
+> 1
+> 2
+
+
+Unary and binary operations are evualted on the operands that have most
+recently been pushed on the stack. This means that expressions are written in
+postfix notation:
+
+| 1 !
+> 0
+
+| 2 3 +
+| 2 3 -
+> 5
+> -1
+
+| 2 3 *
+| 2 3 /
+> 6
+> 0
+
+| 2 3 &
+| 2 3 |
+| 2 3 ^
+> 2
+> 3
+> 1
+
+| 1 dup
+> 1
+> 1
+
+| 1 2 swap
+> 2
+> 1
+
