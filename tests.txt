@@ -7,17 +7,16 @@ It's a stack based language. Operands and operators are pushed on the stack:
 
 | 1
 Remaining operands on the stack are outputted:
-> 1
+> Remaining Stack: 1
 
 | 123
-> 123
+> Remaining Stack: 123
 
 | -1
-> -1
+> Remaining Stack: -1
 
 | 1 2
-> 1
-> 2
+> Remaining Stack: 1 2
 
 
 Unary and binary operations are evualted on the operands that have most
@@ -25,65 +24,55 @@ recently been pushed on the stack. This means that expressions are written in
 postfix notation:
 
 | 1 !
-> 0
+> Remaining Stack: 0
 
 | 2 3 +
 | 2 3 -
-> 5
-> -1
+> Remaining Stack: 5 -1
 
 | 2 3 *
 | 2 3 /
-> 6
-> 0
+> Remaining Stack: 6 0
 
 | 2 3 &
 | 2 3 |
 | 2 3 ^
-> 2
-> 3
-> 1
+> Remaining Stack: 2 3 1
 
 | 1 dup
-> 1
-> 1
+> Remaining Stack: 1 1
 
 | 1 2 swap
-> 2
-> 1
+> Remaining Stack: 2 1
 
 | one{ 1 }
 | one
-> 1
+> Remaining Stack: 1
 
 | 2
 | one{ 1 }
 | one
-> 2
-> 1
+> Remaining Stack: 2 1
 
 | 3
 | two_one{ 2 1 }
 | two_one
-> 3
-> 2
-> 1
+> Remaining Stack: 3 2 1
 
 | inc{ 1 + }
 | 1 inc inc
-> 3
+> Remaining Stack: 3
 
 | inc{ 1 + }
 | inc2{ inc inc }
 | 1 inc2
-> 3
+> Remaining Stack: 3
 
 | 1 if { 1 }
 | 0 if { 2 }
 | 1 if { 3 }
 | 0 if { 4 }
-> 1
-> 3
+> Remaining Stack: 1 3
 
 | 10
 | loop{
@@ -104,4 +93,3 @@ postfix notation:
 > 3
 > 2
 > 1
-

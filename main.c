@@ -1,4 +1,6 @@
 #define TESTS_FILE "./tests.txt"
+#define STDIN_FILENO  0
+#define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 
 typedef signed long int   isize;
@@ -118,29 +120,49 @@ typedef enum {
     DUP,
     DROP,
     SWAP,
-    JUMP_FOREWARD,
-    IGNORE_JUMP_IF_STACK_TOP,
-    LOAD_PREV_INSTRUCTIONS,
+    SKIP_ENCLOSURE,
+    END_ENCLOSURE,
+    EXEC_ENCLOSURE_IF_STACK_TOP,
+    CALL_ENCLOSURE,
     PRINT,
 } Operation;
 
-usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
+const isize UNCLOSED_ENCLOSURE = -2;
+
+typedef struct {
+    usize rollback_byte_i;
+    usize rolback_labels_byte_offsets_len;
+
     // Stores the label and bytecode offset of labeled instructions
     // '<label>\0<offset:u32>'
     u8    labels_byte_offsets[16 * 1024];
-    usize labels_byte_offsets_len = 0;
+    usize labels_byte_offsets_len;
 
-    const usize braces_max_depth = 256;
-    // Stores the starting position of the bytecode, generated for a set of
-    // instructions in braces:
-    //     +----------------+-- positions are stored on the stack --+
-    //     v                v                                       v
-    //     { <instructions> { <instructions> } <instructions> } ... { ... }
-    u32   braces_start_byte_i_stack[braces_max_depth];
-    usize braces_start_byte_i_size = 0;
+    usize byte_i;
+} source_to_bytecode_compiler__State;
+
+void source_to_bytecode_compiler__init(
+    source_to_bytecode_compiler__State* state
+) {
+    state->labels_byte_offsets_len = 0;
+    state->byte_i                  = 0;
+}
+
+isize source_to_bytecode_compiler__compile(
+    source_to_bytecode_compiler__State* state,
+    char* source, u8* bytecode,
+    usize repl_mode
+) {
+    isize err_code = -1;
+
+    state->rolback_labels_byte_offsets_len = state->labels_byte_offsets_len;
+    state->rollback_byte_i                 = state->byte_i;
+
+    const usize enclosure_start_stack_max_size = 1024 / sizeof(u32);
+    u32         enclosure_start_stack[enclosure_start_stack_max_size];
+    usize       enclosure_start_stack_i = 0;
 
     usize source_i = 0;
-    usize byte_i   = 0;
 
     while (source[source_i] != '\0') {
         switch (source[source_i]) {
@@ -157,16 +179,16 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                     x = x*10 + (source[source_i++] - '0');
                 } while (source[source_i] >= '0' && source[source_i] <= '9');
 
-                bytecode[byte_i++] = (u8) PUSH_INT;
+                bytecode[state->byte_i++] = (u8) PUSH_INT;
 
-                *((i32*) (bytecode + byte_i)) = x;
-                byte_i += sizeof(i32);
+                *((i32*) (bytecode + state->byte_i)) = x;
+                state->byte_i += sizeof(i32);
 
                 // Negative numbers are handled in `case '-'` -- see below.
             }; break;
 
             // Arithmetic, bitwise and logical operators
-            case '+': bytecode[byte_i++] = (u8) ADD_INTS; source_i++; break;
+            case '+': bytecode[state->byte_i++] = (u8) ADD_INTS; source_i++; break;
             case '-':
                 // Handle negative numbers
                 if (source[source_i + 1] >= '0' && source[source_i + 1] <= '9') {
@@ -177,60 +199,47 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                         x = x*10 + (source[source_i++] - '0');
                     } while (source[source_i] >= '0' && source[source_i] <= '9');
 
-                    bytecode[byte_i++] = (u8) PUSH_INT;
+                    bytecode[state->byte_i++] = (u8) PUSH_INT;
 
-                    *((i32*) (bytecode + byte_i)) = -x;
-                    byte_i += sizeof(i32);
+                    *((i32*) (bytecode + state->byte_i)) = -x;
+                    state->byte_i += sizeof(i32);
                 // Handle substraction
                 } else {
-                    bytecode[byte_i++] = (u8) SUB_INTS;
+                    bytecode[state->byte_i++] = (u8) SUB_INTS;
                     source_i++;
                 }
                 break;
-            case '*': bytecode[byte_i++] = (u8) MUL_INTS     ; source_i++; break;
-            case '/': bytecode[byte_i++] = (u8) DIV_INTS     ; source_i++; break;
-            case '&': bytecode[byte_i++] = (u8) AND_INTS_BITS; source_i++; break;
-            case '|': bytecode[byte_i++] = (u8) OR_INTS_BITS ; source_i++; break;
-            case '^': bytecode[byte_i++] = (u8) XOR_INTS     ; source_i++; break;
-            case '!': bytecode[byte_i++] = (u8) NOT          ; source_i++; break;
+            case '*': bytecode[state->byte_i++] = (u8) MUL_INTS     ; source_i++; break;
+            case '/': bytecode[state->byte_i++] = (u8) DIV_INTS     ; source_i++; break;
+            case '&': bytecode[state->byte_i++] = (u8) AND_INTS_BITS; source_i++; break;
+            case '|': bytecode[state->byte_i++] = (u8) OR_INTS_BITS ; source_i++; break;
+            case '^': bytecode[state->byte_i++] = (u8) XOR_INTS     ; source_i++; break;
+            case '!': bytecode[state->byte_i++] = (u8) NOT          ; source_i++; break;
 
             case '{': {
-                if (braces_start_byte_i_size >= 256) {
-                    err_msg_begin(); {
-                        err_msg_extend(
-                            "Too much nesting inside braces: { { ... } }!");
-                    }; err_msg_end_and_exit(1);
-                }
+                bytecode[state->byte_i++] = (u8) SKIP_ENCLOSURE;
+                // Add a placeholder for the enclosure length
+                state->byte_i += sizeof(u32);
 
-                //
-                // An opening brace generates bytecode to jump forward to the
-                // end of the bytecode for the instructions, enclosed in the
-                // braces. Because we don't know the length of enclosed
-                // bytecode yet we use a placeholder u32, set to 0, for the
-                // number of bytes to jump and record the starting position
-                // of these placeholder bytes, on a stack, so they can be filled
-                // in when the braces are closed with '}'.
-                //
-
-                bytecode[byte_i++] = (u8) JUMP_FOREWARD;
-
-                braces_start_byte_i_stack[braces_start_byte_i_size++] = byte_i;
-
-                *((u32*) (bytecode + byte_i)) = 0;
-                byte_i += sizeof(u32);
+                enclosure_start_stack[enclosure_start_stack_i++] = state->byte_i;
 
                 source_i++;
             }; break;
             case '}': {
-                if (braces_start_byte_i_size == 0) {
+                if (enclosure_start_stack_i == 0) {
                     err_msg_begin(); {
-                        err_msg_extend("Imbalanced braces: { ... } } !");
-                    }; err_msg_end_and_exit(1);
+                        err_msg_extend("Imbalanced braces: { ... } }!");
+                    }; err_msg_end();
+                    return -1;
                 }
+                // Fill the enclosure length placeholder
+                u32 enclosure_start_byte_i =
+                    enclosure_start_stack[--enclosure_start_stack_i];
+                u32 enclosure_len = state->byte_i - enclosure_start_byte_i;
+                *((u32*) (bytecode + state->byte_i - enclosure_len - sizeof(u32))) =
+                    enclosure_len;
 
-                // Fill in the placeholder for the enclosed bytecode length.
-                u32 braces_start_byte_i = braces_start_byte_i_stack[--braces_start_byte_i_size];
-                *((u32*) (bytecode + braces_start_byte_i)) = byte_i - braces_start_byte_i;
+                bytecode[state->byte_i++] = (u8) END_ENCLOSURE;
 
                 source_i++;
             }; break;
@@ -240,7 +249,7 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                 if (source[source_i + 1] == 'u' &&
                     source[source_i + 2] == 'p'
                 ) {
-                    bytecode[byte_i++] = (u8) DUP;
+                    bytecode[state->byte_i++] = (u8) DUP;
                     source_i += 3;
                     break;
                 } else if (
@@ -248,7 +257,7 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                     source[source_i + 2] == 'o' &&
                     source[source_i + 3] == 'p'
                 ) {
-                    bytecode[byte_i++] = (u8) DROP;
+                    bytecode[state->byte_i++] = (u8) DROP;
                     source_i += 4;
                     break;
                 }
@@ -258,7 +267,7 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                     source[source_i + 2] == 'a' &&
                     source[source_i + 3] == 'p'
                 ) {
-                    bytecode[byte_i++] = (u8) SWAP;
+                    bytecode[state->byte_i++] = (u8) SWAP;
                     source_i += 4;
                     break;
                 }
@@ -267,7 +276,7 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
             // If
             case 'i':
                 if (source[source_i + 1] == 'f') {
-                    bytecode[byte_i++] = (u8) IGNORE_JUMP_IF_STACK_TOP;
+                    bytecode[state->byte_i++] = (u8) EXEC_ENCLOSURE_IF_STACK_TOP;
                     source_i += 2;
                     break;
                 }
@@ -280,7 +289,7 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                     source[source_i + 3] == 'n' &&
                     source[source_i + 4] == 't'
                 ) {
-                    bytecode[byte_i++] = (u8) PRINT;
+                    bytecode[state->byte_i++] = (u8) PRINT;
                     source_i += 5;
                     break;
                 }
@@ -302,57 +311,69 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                             err_msg_extend(label);
                             err_msg_extend(
                                 "...' is longer than the maximum allowed label length!");
-                        }; err_msg_end_and_exit(1);
+                        }; err_msg_end();
+                        return -1;
                     }
                     label[label_len++] = source[source_i++];
                 }
 
+                u8*    labels_byte_offsets     =  state->labels_byte_offsets;
+                usize* labels_byte_offsets_len = &state->labels_byte_offsets_len;
+
                 // Record bytecode offset of labeled instructions '<label>{'
                 if (source[source_i] == '{') {
                     for (usize i = 0; i < label_len; ++i) {
-                        labels_byte_offsets[labels_byte_offsets_len++] = label[i];
+                        labels_byte_offsets[
+                            (*labels_byte_offsets_len)++] = label[i];
                     }
-                    labels_byte_offsets[labels_byte_offsets_len++]  ='\0';
-                    *((u32*) (labels_byte_offsets + labels_byte_offsets_len)) = (u32) byte_i;
-                    labels_byte_offsets_len += sizeof(u32);
+                    state->labels_byte_offsets[
+                        (*labels_byte_offsets_len)++]  ='\0';
+                    *((u32*) (labels_byte_offsets + *labels_byte_offsets_len)) =
+                        (u32) state->byte_i;
+                    *labels_byte_offsets_len += sizeof(u32);
                 // Handle calls to labeled instructions '<label><whitespace>'
-                } else if (source[source_i] == ' '  || source[source_i] == '\t' ||
-                           source[source_i] == '\n' || source[source_i] == '\r' ||
-                           source[source_i] == '\0'
+                } else if (source[source_i] == ' '  || source[source_i] == '}' ||
+                           source[source_i] == '\t' || source[source_i] == '\n' ||
+                           source[source_i] == '\r' || source[source_i] == '\0'
                 ) {
                     // Linearly search for a matching label. This is
                     // inefficient for programs with many labels.
                     // TODO: Use a hash map or B-tree instead
                     usize i = 0;
                     usize found_label_match = 0;
-                    while (i < labels_byte_offsets_len) {
+                    while (i < *labels_byte_offsets_len) {
                         usize j = 0;
                         while (labels_byte_offsets[i] != '\0' && j < label_len
                                && labels_byte_offsets[i++] == label[j++]);
-                        i += 1;
-                        found_label_match = j == label_len;
 
-                        if (found_label_match) break;
+                        found_label_match = labels_byte_offsets[i] == '\0' &&
+                                            j == label_len;
+                        if (found_label_match) {
+                            i++;
+                            break;
+                        }
+
+                        while (labels_byte_offsets[i] != '\0') i++;
+                        i++;
 
                         i += sizeof(u32);
                     }
 
                     if (found_label_match) {
-                        u32 offset = (u32) labels_byte_offsets[i];
-                        offset += 1;
-                        u32 enclosed_bytes_len = (u32) bytecode[offset] - sizeof(u32);
+                        u32 offset = *((u32*) (labels_byte_offsets + i));
+                        offset += (u32) (1 + sizeof(u32));
 
-                        bytecode[byte_i++] = (u8) LOAD_PREV_INSTRUCTIONS;
-                        *((u32*) (bytecode + byte_i)) = offset;
-                        byte_i += sizeof(u32);
-                    }
-                    else {
+                        bytecode[state->byte_i++] = (u8) CALL_ENCLOSURE;
+                        *((u32*) (bytecode + state->byte_i)) = offset;
+                        state->byte_i += sizeof(u32);
+                    } else {
                         label[label_len] = '\0';
                         err_msg_begin(); {
                             err_msg_extend("No instructions previously labeled '");
                             err_msg_extend(label);
                             err_msg_extend("'!");
-                        }; err_msg_end_and_exit(1);
+                        }; err_msg_end();
+                        return -1;
                     }
                 } else {
                     label[label_len] = '\0';
@@ -360,221 +381,277 @@ usize compile_to_instruction_bytecode(char* source, u8* bytecode) {
                         err_msg_extend("Label '");
                         err_msg_extend(label);
                         err_msg_extend("' followed by invalid character!");
-                    }; err_msg_end_and_exit(1);
+                    }; err_msg_end();
+                    return -1;
                 }
             }; break;
         }
     }
 
-    return byte_i;
+    if (enclosure_start_stack_i > 0) {
+        if (!repl_mode) {
+            err_msg_begin(); {
+                err_msg_extend("Unclosed braces: { { ... }!");
+            }; err_msg_end();
+        }
+        return UNCLOSED_ENCLOSURE;
+    }
+
+    return state->byte_i;
+}
+
+void source_to_bytecode_compiler__rollback(source_to_bytecode_compiler__State* state) {
+    state->byte_i                  = state->rollback_byte_i;
+    state->labels_byte_offsets_len = state->rolback_labels_byte_offsets_len;
 }
 
 typedef enum {
     STACK_UNDERFLOW,
     STACK_OVERFLOW,
-    NO_OPENING_BRACE_AFTER_THEN,
+    NO_OPENING_BRACE_AFTER_IF,
     MAX_RECURSION_DEPTH,
 } InterpreterError;
 
-usize interpret_bytecode(u8* bytecode, usize bytecode_len, char* output) {
+typedef struct {
+    u8** rollback_return_address_stack_ptr;
+    i32* rollback_stack_ptr;
+    u8*  rollback_byte_ptr;
+
+    u8** return_address_stack_ptr;
+    u8** return_address_stack_stop_ptr;
+
+    i32* stack_start_ptr;
+    i32* stack_stop_ptr;
+    i32* stack_ptr;
+
+    u8* bytecode;
+    u8* byte_ptr;
+} bytecode_interpreter__State;
+
+void bytecode_interpreter__init(bytecode_interpreter__State* state,
+    u8* bytecode,
+    void* preallocated_memory, usize preallocated_memory_size
+) {
+    void* memory_ptr = preallocated_memory;
+
+    const usize return_address_stack_max_size = 4096;
+    u8**   return_address_stack          = memory_ptr;
+    state->return_address_stack_ptr      = return_address_stack;
+    state->return_address_stack_stop_ptr =
+        return_address_stack + return_address_stack_max_size;
+    memory_ptr += return_address_stack_max_size;
+
+    const usize stack_max_size = 16 * 1024;
+    const usize stack_underflow_padding = 2 * sizeof(i32);
+    const usize stack_overflow_padding  = 2 * sizeof(i32);
+    i32*  stack            = memory_ptr;
+    state->stack_start_ptr = stack + stack_underflow_padding;
+    state->stack_stop_ptr  = stack + stack_max_size - stack_overflow_padding;
+    state->stack_ptr       = state->stack_start_ptr - 1;
+    memory_ptr += stack_max_size;
+
+    state->bytecode = bytecode;
+    state->byte_ptr = bytecode;
+
+    if ((memory_ptr - preallocated_memory) > preallocated_memory_size) {
+        err_msg_begin(); {
+            err_msg_extend("Not enough preallocated memory for bytecode "
+                           "interpreter!");
+        }; err_msg_end_and_exit(1);
+    }
+}
+
+isize bytecode_interpreter__interpret(bytecode_interpreter__State* state,
+    usize bytecode_len, char* output
+) {
     InterpreterError err;
+
+    state->rollback_byte_ptr                 = state->byte_ptr;
+    state->rollback_stack_ptr                = state->stack_ptr;
+    state->rollback_return_address_stack_ptr = state->return_address_stack_ptr;
 
     char* output_ptr = output;
 
-    u8* source_bytecode_stop_ptr = bytecode + bytecode_len;
-    u8* source_byte_ptr          = bytecode;
-
-    const usize tmp_bytecode_max      = 16 * 1024;
-    u8          tmp_bytecode[tmp_bytecode_max];
-    u8*         tmp_bytecode_stop_ptr = tmp_bytecode + tmp_bytecode_max;
-    u8*         tmp_byte_ptr = tmp_bytecode_stop_ptr;
-
-    const usize stack_max_size = 16 * 1024;
-    const usize stack_underflow_padding = 2;
-    const usize stack_overflow_padding = 2;
-    i32         stack[stack_max_size];
-    i32*        stack_start_ptr = stack + stack_underflow_padding;
-    i32*        stack_stop_ptr  = stack + stack_max_size - stack_overflow_padding;
-    i32*        stack_ptr       = stack_start_ptr - 1;
-
-    usize in_tmp_bytecode = 0;
-    u8* byte_ptr          = source_byte_ptr;
-    u8* bytecode_stop_ptr = source_bytecode_stop_ptr;
-    while (1) {
-        while (byte_ptr < bytecode_stop_ptr) {
-            switch (*byte_ptr++) {
-                case PUSH_INT:
-                    *(++stack_ptr) = *((i32*) byte_ptr);
-                    byte_ptr += sizeof(i32);
-                    goto check_stack_not_empty;
-                case ADD_INTS:
-                    *(stack_ptr - 1) += *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case SUB_INTS:
-                    *(stack_ptr - 1) -= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case MUL_INTS:
-                    *(stack_ptr - 1) *= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case DIV_INTS:
-                    *(stack_ptr - 1) /= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case AND_INTS_BITS:
-                    *(stack_ptr - 1) &= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case OR_INTS_BITS:
-                    *(stack_ptr - 1) |= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case XOR_INTS:
-                    *(stack_ptr - 1) ^= *stack_ptr;
-                    --stack_ptr;
-                    goto check_stack_not_empty;
-                case NOT:
-                    *stack_ptr = !(*stack_ptr);
-                    break;
-                case DUP:
-                    *(stack_ptr + 1) = *stack_ptr;
-                    ++stack_ptr;
-                    goto check_stack_not_empty;
-                case DROP:
-                    --stack_ptr;
-                    goto check_stack_underflow;
-                case SWAP:
-                    i32 tmp = *stack_ptr;
-                    *stack_ptr       = *(stack_ptr - 1);
-                    *(stack_ptr - 1) = tmp;
-                    break;
-                case JUMP_FOREWARD:
-                    byte_ptr += *((u32*) byte_ptr);
-                    break;
-                case IGNORE_JUMP_IF_STACK_TOP:
-                    if (*stack_ptr--) {
-                        if (byte_ptr == bytecode_stop_ptr ||
-                            *(byte_ptr++) != (u8) JUMP_FOREWARD
-                        ) {
-                            err = NO_OPENING_BRACE_AFTER_THEN;
-                            goto err_handling;
-                        }
-                        byte_ptr += sizeof(u32);
+    u8* bytecode_stop_ptr = state->bytecode + bytecode_len;
+    while (state->byte_ptr < bytecode_stop_ptr) {
+        switch (*state->byte_ptr++) {
+            case PUSH_INT:
+                *(++state->stack_ptr) = *((i32*) state->byte_ptr);
+                state->byte_ptr += sizeof(i32);
+                goto check_stack_not_empty;
+            case ADD_INTS:
+                *(state->stack_ptr - 1) += *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case SUB_INTS:
+                *(state->stack_ptr - 1) -= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case MUL_INTS:
+                *(state->stack_ptr - 1) *= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case DIV_INTS:
+                *(state->stack_ptr - 1) /= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case AND_INTS_BITS:
+                *(state->stack_ptr - 1) &= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case OR_INTS_BITS:
+                *(state->stack_ptr - 1) |= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case XOR_INTS:
+                *(state->stack_ptr - 1) ^= *state->stack_ptr;
+                --state->stack_ptr;
+                goto check_stack_not_empty;
+            case NOT:
+                *state->stack_ptr = !(*state->stack_ptr);
+                break;
+            case DUP:
+                *(state->stack_ptr + 1) = *state->stack_ptr;
+                ++state->stack_ptr;
+                goto check_stack_not_empty;
+            case DROP:
+                --state->stack_ptr;
+                goto check_stack_underflow;
+            case SWAP:
+                i32 tmp = *state->stack_ptr;
+                *state->stack_ptr       = *(state->stack_ptr - 1);
+                *(state->stack_ptr - 1) = tmp;
+                break;
+            case SKIP_ENCLOSURE:
+                state->byte_ptr += 
+                    *((u32*) state->byte_ptr)  // enclosure length
+                    + sizeof(u32)              // + n bytes storing enclosure length
+                    + 1;                       // + 1 "END_ENCLOSURE" byte
+                break;
+            case END_ENCLOSURE:
+                u8* return_address = *(--state->return_address_stack_ptr);
+                // When an enclosure is used as the body of an 'if', the
+                // enclosure's return address is set to 0 to signal that it
+                // it does not return and should be ignored.
+                if (return_address) state->byte_ptr = return_address;
+                break;
+            case EXEC_ENCLOSURE_IF_STACK_TOP:
+                if (*state->stack_ptr--) {
+                    if (state->byte_ptr == bytecode_stop_ptr ||
+                        *(state->byte_ptr++) != (u8) SKIP_ENCLOSURE
+                    ) {
+                        err = NO_OPENING_BRACE_AFTER_IF;
+                        goto err_handling;
                     }
-                    goto check_stack_underflow;
-                case LOAD_PREV_INSTRUCTIONS:
-                    u8* src_ptr = bytecode + *((u32*) byte_ptr);
-                    byte_ptr += sizeof(u32);
-                    u32 src_len   = *((u32*) (src_ptr)) - sizeof(u32);
-                    src_ptr += sizeof(u32);
+                    state->byte_ptr += sizeof(u32);
 
-                    if (!in_tmp_bytecode) {
-                        source_byte_ptr = byte_ptr;
-
-                        byte_ptr          = tmp_byte_ptr;
-                        bytecode_stop_ptr = tmp_bytecode_stop_ptr;
-
-                        in_tmp_bytecode = 1;
-                    }
-
-                    byte_ptr -= src_len;
-                    if (byte_ptr < tmp_bytecode ||
-                        // Handle pointer underflow
-                        byte_ptr >= tmp_bytecode_stop_ptr
+                    // 'if's don't return so we set their return address to 0.
+                    // This signals the future END_ENCLOSURE step not to
+                    // return.
+                    *state->return_address_stack_ptr++ = 0;
+                    if (state->return_address_stack_ptr ==
+                        state->return_address_stack_stop_ptr
                     ) {
                         err = MAX_RECURSION_DEPTH;
                         goto err_handling;
                     }
-                    for (usize i = 0; i < src_len; ++i) {
-                        *(byte_ptr + i) = *(src_ptr + i);
-                    }
-                    break;
-                case PRINT:
-                    i32 x = *stack_ptr--;
+                }
+                goto check_stack_underflow;
+            case CALL_ENCLOSURE: {
+                u32 call_address = *((u32*) state->byte_ptr);
+                state->byte_ptr += sizeof(u32);
+                *state->return_address_stack_ptr++ = state->byte_ptr;
+                if (state->return_address_stack_ptr ==
+                    state->return_address_stack_stop_ptr
+                ) {
+                    err = MAX_RECURSION_DEPTH;
+                    goto err_handling;
+                }
 
-                    usize is_negative = x < 0;
-                    if (x < 0) {
-                        x = -x;
-                        *output_ptr++ = '-';
-                    }
+                state->byte_ptr = state->bytecode + call_address;
+            }; break;
+            case PRINT:
+                i32 x = *state->stack_ptr--;
 
-                    // 1. Append digits to output
-                    char* digits_swap_lower_ptr = output_ptr;
-                    do {
-                        *output_ptr++ = (x % 10) + '0';
-                        x /= 10;
-                    } while (x);
-                    char* digits_swap_upper_ptr = output_ptr;
-                    // 2. Swap digit order
-                    while (digits_swap_lower_ptr < digits_swap_upper_ptr) {
-                        char tmp = *digits_swap_lower_ptr;
-                        *digits_swap_lower_ptr++ = *(--digits_swap_upper_ptr);
-                        *digits_swap_upper_ptr = tmp;
-                    }
+                usize is_negative = x < 0;
+                if (x < 0) {
+                    x = -x;
+                    *output_ptr++ = '-';
+                }
 
-                    *output_ptr++ = '\n';
-                    goto check_stack_underflow;
-            }
+                // 1. Append digits to output
+                char* digits_swap_lower_ptr = output_ptr;
+                do {
+                    *output_ptr++ = (x % 10) + '0';
+                    x /= 10;
+                } while (x);
+                char* digits_swap_upper_ptr = output_ptr;
+                // 2. Swap digit order
+                while (digits_swap_lower_ptr < digits_swap_upper_ptr) {
+                    char tmp = *digits_swap_lower_ptr;
+                    *digits_swap_lower_ptr++ = *(--digits_swap_upper_ptr);
+                    *digits_swap_upper_ptr = tmp;
+                }
 
-            continue;
-
-        check_stack_not_empty:
-            if (stack_ptr < stack_start_ptr) {
-                err = STACK_UNDERFLOW;
-                goto err_handling;
-            }
-            continue;
-
-        check_stack_underflow:
-            if (stack_ptr < stack_start_ptr - 1) {
-                err = STACK_UNDERFLOW;
-                goto err_handling;
-            }
-            continue;
-
-        check_stack_overflow:
-            if (stack_ptr >= stack_stop_ptr) {
-                err = STACK_OVERFLOW;
-                goto err_handling;
-            }
+                *output_ptr++ = '\n';
+                goto check_stack_underflow;
         }
 
-        if (!in_tmp_bytecode) break;
+        continue;
 
-        tmp_byte_ptr = byte_ptr;
+    check_stack_not_empty:
+        if (state->stack_ptr < state->stack_start_ptr) {
+            err = STACK_UNDERFLOW;
+            goto err_handling;
+        }
+        continue;
 
-        byte_ptr          = source_byte_ptr;
-        bytecode_stop_ptr = source_bytecode_stop_ptr;
+    check_stack_underflow:
+        if (state->stack_ptr < state->stack_start_ptr - 1) {
+            err = STACK_UNDERFLOW;
+            goto err_handling;
+        }
+        continue;
 
-        in_tmp_bytecode = 0;
+    check_stack_overflow:
+        if (state->stack_ptr >= state->stack_stop_ptr) {
+            err = STACK_OVERFLOW;
+            goto err_handling;
+        }
     }
 
     // Output the integers, remaining on the stack
-    for (i32* ptr = stack_start_ptr; ptr <= stack_ptr; ++ptr) {
-        i32 x = *ptr;
-
-        usize is_negative = x < 0;
-        if (x < 0) {
-            x = -x;
-            *output_ptr++ = '-';
+    if (state->stack_start_ptr <= state->stack_ptr) {
+        char* msg_ptr = "Remaining Stack:";
+        for (; *msg_ptr != '\0'; ++msg_ptr) {
+            *output_ptr++ = *msg_ptr;
         }
 
-        // 1. Append digits to output
-        char* digits_swap_lower_ptr = output_ptr;
-        do {
-            *output_ptr++ = (x % 10) + '0';
-            x /= 10;
-        } while (x);
-        char* digits_swap_upper_ptr = output_ptr;
-        // 2. Swap digit order
-        while (digits_swap_lower_ptr < digits_swap_upper_ptr) {
-            char tmp = *digits_swap_lower_ptr;
-            *digits_swap_lower_ptr++ = *(--digits_swap_upper_ptr);
-            *digits_swap_upper_ptr = tmp;
-        }
+        for (i32* ptr = state->stack_start_ptr; ptr <= state->stack_ptr; ++ptr) {
+            *output_ptr++ = ' ';
 
+            i32 x = *ptr;
+
+            usize is_negative = x < 0;
+            if (x < 0) {
+                x = -x;
+                *output_ptr++ = '-';
+            }
+
+            // 1. Append digits to output
+            char* digits_swap_lower_ptr = output_ptr;
+            do {
+                *output_ptr++ = (x % 10) + '0';
+                x /= 10;
+            } while (x);
+            char* digits_swap_upper_ptr = output_ptr;
+            // 2. Swap digit order
+            while (digits_swap_lower_ptr < digits_swap_upper_ptr) {
+                char tmp = *digits_swap_lower_ptr;
+                *digits_swap_lower_ptr++ = *(--digits_swap_upper_ptr);
+                *digits_swap_upper_ptr = tmp;
+            }
+        }
         *output_ptr++ = '\n';
     }
 
@@ -593,8 +670,8 @@ err_handling:
         case STACK_OVERFLOW:
             err_msg = "Stack overflow";
             break;
-        case NO_OPENING_BRACE_AFTER_THEN:
-            err_msg = "'then' must be followed by braces: { ... }";
+        case NO_OPENING_BRACE_AFTER_IF:
+            err_msg = "'if' must be followed by braces: { ... }";
             break;
         case MAX_RECURSION_DEPTH:
             err_msg = "Max recursion depth!";
@@ -603,14 +680,107 @@ err_handling:
     for (usize i = 0; err_msg[i] != '\0'; ++i) {
         *output_ptr++ = err_msg[i];
     }
+    *output_ptr++ = '\n';
 
-    return output_ptr - output;
+    // We return the negative length to signal error occurance
+    return -((isize) (output_ptr - output));
 }
 
-void _start(void) {
+void bytecode_interpreter__rollback(bytecode_interpreter__State* state) {
+    state->byte_ptr                 = state->rollback_byte_ptr;
+    state->stack_ptr                = state->rollback_stack_ptr;
+    state->return_address_stack_ptr = state->rollback_return_address_stack_ptr;
+}
+
+void run_repl(void) {
+    u8    bytecode[16 * 1024];
+
+    char  input[4096];
+    usize input_len    = 0;
+    usize indent_depth = 0;
+
+    source_to_bytecode_compiler__State compiler_state;
+    source_to_bytecode_compiler__init(&compiler_state);
+
+    const usize interpreter_memory_size = 48 * 1024;
+    u8*         interpreter_memory[interpreter_memory_size];
+    bytecode_interpreter__State interpreter_state;
+    bytecode_interpreter__init(&interpreter_state,
+            bytecode,
+            interpreter_memory, interpreter_memory_size);
+
+    write_(STDOUT_FILENO, "q/quit to quit.\n", 16);
+    while (1) {
+        for (usize i = 0; i <= indent_depth; ++i) {
+            write_(STDOUT_FILENO, ".   ", 4);
+        }
+
+        // Handle multi-line input enclosed in braces: { ...\n... }
+        if (indent_depth > 0) {
+            int input_advance = read_(STDOUT_FILENO, input + input_len, 4096);
+            for (usize i = input_len; i < input_len + input_advance; ++i) {
+                switch (input[i]) {
+                    case '{': indent_depth++; break;
+                    case '}': indent_depth--; break;
+                }
+            }
+            input_len += input_advance;
+        } else {
+            input_len += read_(STDOUT_FILENO, input + input_len, 4096);
+        }
+
+        if (indent_depth == 0) {
+            if ((input_len == 2 && input[0] == 'q' && input[1] == '\n') ||
+                (input_len == 5 &&
+                 input[0] == 'q' && input[1] == 'u' && input[2] == 'i' && input[3] == 't'
+                 && input[4] == '\n')
+            ) {
+                write_(STDOUT_FILENO, "Quitting!\n", 10);
+                exit_(0);
+            }
+
+            input[input_len] = '\0';
+
+            isize compile_result =
+                source_to_bytecode_compiler__compile(
+                    &compiler_state,
+                    input, bytecode, 1);
+            if (compile_result < 0) {
+                source_to_bytecode_compiler__rollback(&compiler_state);
+
+                if (compile_result == UNCLOSED_ENCLOSURE) {
+                    indent_depth = 1;
+                } else {
+                    // source_to_bytecode_compiler__compile outputs an error message
+                    input_len = 0;
+                }
+                continue;
+            }
+            usize bytecode_len = compile_result;
+            input_len = 0;
+
+            char  output[4096];
+            isize output_len = bytecode_interpreter__interpret(
+                &interpreter_state,
+                bytecode_len, output);
+            if (output_len < 0) {
+                source_to_bytecode_compiler__rollback(&compiler_state);
+                bytecode_interpreter__rollback       (&interpreter_state);
+
+                output_len = -output_len;
+            }
+            write_(STDOUT_FILENO, output, output_len);
+        }
+    }
+}
+
+void run_tests_from_test_file(void) {
     const usize file_content_capacity = 16 * 1024;
     char        file_content[file_content_capacity];
     isize file_content_len = read_tests_file_content(file_content, file_content_capacity);
+
+    const usize interpreter_memory_size = 48 * 1024;
+    u8*         interpreter_memory[interpreter_memory_size];
 
     usize i = 0;
     while (i < file_content_len) {
@@ -651,13 +821,23 @@ void _start(void) {
         //write_(1, "Expected output:\n", 17);
         //write_(1, expected_output, expected_output_len);
 
+        source_to_bytecode_compiler__State compiler_state;
+        source_to_bytecode_compiler__init(&compiler_state);
         u8 bytecode[16 * 1024];
-        usize bytecode_len = compile_to_instruction_bytecode(test_source, bytecode);
+        isize bytecode_len = source_to_bytecode_compiler__compile(
+            &compiler_state,
+            test_source, bytecode, 0);
+        if (bytecode_len < 0) exit_(1);
         //write_(1, "Bytecode:\n", 10);
         //write_(1, bytecode, bytecode_len);
 
         char  output[4096];
-        usize output_len = interpret_bytecode(bytecode, bytecode_len, output);
+        bytecode_interpreter__State interpreter_state;
+        bytecode_interpreter__init(&interpreter_state,
+            bytecode,
+            interpreter_memory, interpreter_memory_size);
+        usize output_len = bytecode_interpreter__interpret(
+            &interpreter_state, bytecode_len, output);
         write_(1, "Output:\n", 8);
         write_(1, output, output_len);
 
@@ -675,7 +855,41 @@ void _start(void) {
             err_msg_extend("Test Failed!");
         }; err_msg_end_and_exit(1);
     }
+}
+
+void main_(int argc, char** argv) {
+    usize arg_i = 0;
+    char* program = argv[arg_i++];
+
+    char* command = argv[arg_i++];
+    switch (command[0]) {
+        case 'r':
+            if (command[1] == 'e' &&
+                command[2] == 'p' &&
+                command[3] == 'l' &&
+                command[4] == '\0'
+            ) {
+                run_repl();
+                break;
+            }
+            // Fallthrough!
+        case 't':
+            if (command[1] == 'e' &&
+                command[2] == 's' &&
+                command[3] == 't' &&
+                command[4] == '\0'
+            ) {
+                run_tests_from_test_file();
+                break;
+            }
+            // Fallthrough!
+        default:
+            err_msg_begin(); {
+                err_msg_extend("Unknown command '");
+                err_msg_extend(command);
+                err_msg_extend("'!");
+            }; err_msg_end();
+    }
 
     exit_(0);
 }
-
