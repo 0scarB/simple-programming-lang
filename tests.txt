@@ -77,7 +77,7 @@ postfix notation:
 | 10
 | loop{
 |     dup
-|     print
+|     print_int
 |     1 -
 |     dup if { loop }
 | }
@@ -93,3 +93,36 @@ postfix notation:
 > 3
 > 2
 > 1
+
+| greeting"Hello, World!"
+| greeting print_str
+> Hello, World!
+
+| counter[ 0 ]
+| loop{
+|     0 counter load_int
+|     1 +
+|     dup print_int
+|     dup 0 counter store_int
+|     10 < if{ loop }
+| }
+| loop
+> 1
+> 2
+> 3
+> 4
+> 5
+> 6
+> 7
+> 8
+> 9
+> 10
+
+| fail"Fail!"
+| word"Dusk"
+| 1 word load_char 'u' =! if{ fail print_str }
+| 'a' 1 word store_char
+| 2 word load_char 's' =! if{ fail print_str }
+| 'r' 2 word store_char
+| word print_str
+> Dark
